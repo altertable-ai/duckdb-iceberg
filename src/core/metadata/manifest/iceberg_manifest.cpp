@@ -3,6 +3,7 @@
 #include "core/metadata/manifest/iceberg_manifest_list.hpp"
 #include "core/metadata/manifest/iceberg_avro_codec.hpp"
 
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -217,13 +218,17 @@ map<idx_t, LogicalType> IcebergDataFile::GetFieldIdToTypeMapping(const IcebergSn
                                                                  const IcebergTableMetadata &metadata,
                                                                  const unordered_set<int32_t> &partition_spec_ids) {
 	D_ASSERT(!partition_spec_ids.empty());
-	auto &partition_specs = metadata.GetPartitionSpecs();
 	auto &schema = metadata.GetSchemaFromId(snapshot_info.schema_id);
 
 	map<idx_t, LogicalType> partition_field_id_to_type;
 	for (auto &spec_id : partition_spec_ids) {
-		auto &partition_spec = partition_specs.at(spec_id);
-		auto &fields = partition_spec.GetFields();
+		auto partition_spec = metadata.FindPartitionSpecById(spec_id);
+		if (!partition_spec) {
+			throw InvalidConfigurationException("Manifest refers to partition spec %d, which is not in the table's "
+			                                    "partition-specs",
+			                                    spec_id);
+		}
+		auto &fields = partition_spec->GetFields();
 
 		for (auto &field : fields) {
 			auto type = IcebergPartitionConstants::GetType(field.source_id, schema, metadata.GetSchemas());
@@ -312,6 +317,35 @@ bool IcebergDataFile::HasFirstRowId() const {
 int64_t IcebergDataFile::GetFirstRowId() const {
 	D_ASSERT(HasFirstRowId());
 	return *first_row_id;
+}
+
+optional_ptr<const string> IcebergDataFile::SingleReferencedDataFile() const {
+	if (referenced_data_file) {
+		return &*referenced_data_file;
+	}
+	if (content != IcebergManifestEntryContentType::POSITION_DELETES) {
+		return nullptr;
+	}
+	//! SPEC: Lower bounds must be less than or equal to all non-null and non-NaN values and upper bounds must be
+	//! greater than or equal to all non-null and non-NaN values.
+	//! Equal 'file_path' bounds therefore mean that every row of this delete file refers to that one data file.
+	//! Writers may leave 'referenced_data_file' unset and record only these bounds (Spark does), and Iceberg Java
+	//! reads them the same way (ContentFileUtil.referencedDataFile). Missing or unequal bounds prove nothing.
+	//! This relies on the bounds being valid: if a writer truncates both to the same prefix, no data file path
+	//! equals it and the deletes in the file are not applied.
+	auto lower = lower_bounds.find(MultiFileReader::DELETE_FILE_PATH_FIELD_ID);
+	auto upper = upper_bounds.find(MultiFileReader::DELETE_FILE_PATH_FIELD_ID);
+	if (lower == lower_bounds.end() || upper == upper_bounds.end()) {
+		return nullptr;
+	}
+	if (lower->second.IsNull() || upper->second.IsNull()) {
+		return nullptr;
+	}
+	auto &path = StringValue::Get(lower->second);
+	if (path != StringValue::Get(upper->second)) {
+		return nullptr;
+	}
+	return &path;
 }
 
 bool IcebergDataFile::IsDeletionVector() const {
@@ -415,26 +449,43 @@ optional<sequence_number_t> IcebergManifestEntry::ExplicitFileSequenceNumber() c
 	return file_sequence_number;
 }
 
-sequence_number_t IcebergManifestEntry::GetSequenceNumber(const IcebergManifest &manifest_file) const {
-	if (!sequence_number) {
-		if (status != IcebergManifestEntryStatusType::ADDED) {
-			throw InvalidConfigurationException(
-			    "'manifest_entry.sequence_number' is only allowed to be NULL for ADDED entries");
-		}
+static optional<sequence_number_t> InheritSequenceNumber(const optional<sequence_number_t> &explicit_value,
+                                                         IcebergManifestEntryStatusType status,
+                                                         const IcebergManifest &manifest_file) {
+	if (explicit_value) {
+		return explicit_value;
+	}
+	// Only ADDED entries inherit the manifest's sequence number when theirs is NULL
+	if (status == IcebergManifestEntryStatusType::ADDED) {
 		return manifest_file.sequence_number;
 	}
-	return *sequence_number;
+	return nullopt;
+}
+
+optional<sequence_number_t> IcebergManifestEntry::TryGetSequenceNumber(const IcebergManifest &manifest_file) const {
+	return InheritSequenceNumber(sequence_number, status, manifest_file);
+}
+
+optional<sequence_number_t> IcebergManifestEntry::TryGetFileSequenceNumber(const IcebergManifest &manifest_file) const {
+	return InheritSequenceNumber(file_sequence_number, status, manifest_file);
+}
+
+sequence_number_t IcebergManifestEntry::GetSequenceNumber(const IcebergManifest &manifest_file) const {
+	auto result = TryGetSequenceNumber(manifest_file);
+	if (!result) {
+		throw InvalidConfigurationException(
+		    "'manifest_entry.sequence_number' is only allowed to be NULL for ADDED entries");
+	}
+	return *result;
 }
 
 sequence_number_t IcebergManifestEntry::GetFileSequenceNumber(const IcebergManifest &manifest_file) const {
-	if (!file_sequence_number) {
-		if (status != IcebergManifestEntryStatusType::ADDED) {
-			throw InvalidConfigurationException(
-			    "'manifest_entry.file_sequence_number' is only allowed to be NULL for ADDED entries");
-		}
-		return manifest_file.sequence_number;
+	auto result = TryGetFileSequenceNumber(manifest_file);
+	if (!result) {
+		throw InvalidConfigurationException(
+		    "'manifest_entry.file_sequence_number' is only allowed to be NULL for ADDED entries");
 	}
-	return *file_sequence_number;
+	return *result;
 }
 
 void IcebergManifestEntry::SetSnapshotId(optional<int64_t> value) {
@@ -576,7 +627,7 @@ static LogicalType PartitionStructType(vector<IcebergExtendedPartitionInfo> exte
 				children.emplace_back(entry.name, LogicalType::INTEGER);
 				break;
 			case IcebergTransformType::INVALID:
-			case IcebergTransformType::VOID:
+			case IcebergTransformType::VOID_TRANSFORM:
 				throw InvalidInputException("Cannot use this transform type");
 				break;
 			default:
@@ -812,7 +863,7 @@ idx_t WriteToFile(const IcebergTableMetadata &table_metadata, const IcebergManif
 		copy_info.options["codec"].push_back(Value(avro_codec));
 	}
 
-	CopyFunctionBindInput input(copy_info);
+	CopyFunctionBindInput input(copy_info, copy.function_info);
 	input.file_extension = "avro";
 
 	ThreadContext thread_context(context);

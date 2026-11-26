@@ -68,12 +68,6 @@ write.delete.mode	copy-on-write
 write.update.mode	copy-on-write
 
 
-# table property is copy-on-write, so there is an error
-statement error
-delete from my_datalake.default.test where a %2 = 0;
-----
-<REGEX>:.*Not implemented Error.*write.delete.mode.*copy-on-write.*test.*
-
 # set the table property to merge on read
 statement ok
 CALL set_iceberg_table_properties(my_datalake.default.test,
@@ -81,7 +75,7 @@ CALL set_iceberg_table_properties(my_datalake.default.test,
         'write.delete.mode' : 'merge-on-read',
         });
 
-# table property is now merge on read, so there is no error
+# table property is now merge on read, so the delete writes a delete file
 statement ok
 delete from my_datalake.default.test where a %2 = 0;
 
@@ -180,10 +174,42 @@ CALL remove_iceberg_table_properties(my_datalake.default.reserved_properties, ['
 ----
 <REGEX>:.*'uuid' is a reserved Iceberg table property and can't be changed with remove_iceberg_table_properties\(\).*
 
+statement error
+ALTER TABLE my_datalake.default.reserved_properties SET ('uuid' = 'x');
+----
+<REGEX>:.*'uuid' is a reserved Iceberg table property and can't be changed with ALTER TABLE \.\.\. SET.*
+
+statement error
+ALTER TABLE my_datalake.default.reserved_properties SET ('foo' = 'bar', 'Current-Snapshot-Id' = '1');
+----
+<REGEX>:.*'Current-Snapshot-Id' is a reserved Iceberg table property and can't be changed with ALTER TABLE \.\.\. SET.*
+
 query I
-SELECT count(*) FROM iceberg_table_properties(my_datalake.default.reserved_properties) WHERE key IN ('format-version', 'foo', 'Current-Snapshot-Id');
+SELECT count(*) FROM iceberg_table_properties(my_datalake.default.reserved_properties) WHERE key IN ('format-version', 'foo', 'Current-Snapshot-Id', 'uuid');
 ----
 0
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.reserved_properties_create;
+
+statement error
+CREATE TABLE my_datalake.default.reserved_properties_create (a INTEGER) WITH ('snapshot-count' = '99');
+----
+<REGEX>:.*'snapshot-count' is a reserved Iceberg table property and can't be changed with CREATE TABLE \.\.\. WITH.*
+
+statement error
+CREATE TABLE my_datalake.default.reserved_properties_create WITH ('Default-Sort-Order' = 'x') AS SELECT 1 a;
+----
+<REGEX>:.*'Default-Sort-Order' is a reserved Iceberg table property and can't be changed with CREATE TABLE \.\.\. WITH.*
+
+# format-version selects the table version on create, in any case
+statement ok
+CREATE TABLE my_datalake.default.reserved_properties_create (a INTEGER) WITH ('Format-Version' = '2', 'foo' = 'bar');
+
+query II
+SELECT key, value FROM iceberg_table_properties(my_datalake.default.reserved_properties_create) WHERE key IN ('format-version', 'foo') ORDER BY key;
+----
+foo	bar
 
 # every listed property is removed, not only the first
 statement ok

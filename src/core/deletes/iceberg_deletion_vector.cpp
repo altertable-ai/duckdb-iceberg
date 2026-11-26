@@ -1,10 +1,10 @@
 #include "core/deletes/iceberg_deletion_vector.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/array.hpp"
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/json_document.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 
 namespace duckdb {
@@ -14,30 +14,11 @@ namespace {
 class CRC32 {
 public:
 	CRC32() : crc(0xFFFFFFFF) {
-		InitTable();
-	}
-
-public:
-	static void InitTable() {
-		if (table_initialized)
-			return;
-
-		for (uint32_t i = 0; i < 256; i++) {
-			uint32_t c = i;
-			for (int j = 0; j < 8; j++) {
-				if (c & 1) {
-					c = 0xEDB88320 ^ (c >> 1);
-				} else {
-					c = c >> 1;
-				}
-			}
-			crc_table[i] = c;
-		}
-		table_initialized = true;
 	}
 
 public:
 	void Update(const data_t *data, idx_t length) {
+		auto &crc_table = GetTable();
 		for (idx_t i = 0; i < length; i++) {
 			crc = crc_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
 		}
@@ -56,38 +37,64 @@ public:
 	}
 
 private:
-	uint32_t crc;
-	static uint32_t crc_table[256];
-	static bool table_initialized;
-};
+	//! Deletion vectors are read and written by several threads at once, so the table is built by a thread-safe
+	//! static initializer
+	static const array<uint32_t, 256> &GetTable() {
+		static const array<uint32_t, 256> crc_table = [] {
+			array<uint32_t, 256> table;
+			for (uint32_t i = 0; i < 256; i++) {
+				uint32_t c = i;
+				for (int j = 0; j < 8; j++) {
+					if (c & 1) {
+						c = 0xEDB88320 ^ (c >> 1);
+					} else {
+						c = c >> 1;
+					}
+				}
+				table[i] = c;
+			}
+			return table;
+		}();
+		return crc_table;
+	}
 
-uint32_t CRC32::crc_table[256];
-bool CRC32::table_initialized = false;
+private:
+	uint32_t crc;
+};
 
 } // namespace
 
 shared_ptr<IcebergDeletionVectorData> IcebergDeletionVectorData::FromBlob(const IcebergFileIdentity &file,
                                                                           data_ptr_t blob_start, idx_t blob_length) {
 	//! https://iceberg.apache.org/puffin-spec/#deletion-vector-v1-blob-type
+	//! The blob is a 4-byte length field, the magic bytes, the bitmaps and a 4-byte checksum. It comes from a file,
+	//! so every read is checked against the blob length before it happens.
 
-	auto blob_end = blob_start + blob_length;
-	auto vector_size = Load<uint32_t>(blob_start);
-	vector_size = BSwap(vector_size);
-	blob_start += sizeof(uint32_t);
-	D_ASSERT(blob_start < blob_end);
-
-	if (blob_length < 12) {
-		throw InvalidConfigurationException("Blob is too small (length of %d bytes) to be a deletion-vector-v1",
-		                                    blob_length);
+	//! The length field, the magic bytes, the bitmap count and the checksum
+	constexpr idx_t MIN_BLOB_LENGTH = sizeof(uint32_t) + 4 + sizeof(int64_t) + sizeof(uint32_t);
+	if (blob_length < MIN_BLOB_LENGTH) {
+		throw InvalidInputException("Blob is too small (length of %d bytes) to be a deletion-vector-v1", blob_length);
 	}
+
+	//! The length field covers the magic bytes and the bitmaps, so it must equal the blob length minus the length
+	//! field and the checksum. Iceberg Java refuses a blob otherwise.
+	auto vector_size = BSwap(Load<uint32_t>(blob_start));
+	blob_start += sizeof(uint32_t);
+	idx_t expected_vector_size = blob_length - 2 * sizeof(uint32_t);
+	if (vector_size != expected_vector_size) {
+		throw InvalidInputException("Invalid bitmap data length (%d) in deletion vector of %d bytes, expected %d, the "
+		                            "DeletionVector is corrupted",
+		                            vector_size, blob_length, expected_vector_size);
+	}
+	//! Where the bitmaps end and the checksum starts
+	auto vector_end = blob_start + vector_size;
+
 	constexpr char DELETION_VECTOR_MAGIC[] = {'\xD1', '\xD3', '\x39', '\x64'};
 	char magic_bytes[4];
 
 	auto checksummed_data_start = blob_start;
 	memcpy(magic_bytes, blob_start, 4);
 	blob_start += 4;
-	vector_size -= 4;
-	D_ASSERT(blob_start < blob_end);
 
 	auto memcmp_res = memcmp(DELETION_VECTOR_MAGIC, magic_bytes, 4);
 	if (memcmp_res != 0) {
@@ -96,31 +103,50 @@ shared_ptr<IcebergDeletionVectorData> IcebergDeletionVectorData::FromBlob(const 
 
 	int64_t amount_of_bitmaps = Load<int64_t>(blob_start);
 	blob_start += sizeof(int64_t);
-	vector_size -= sizeof(int64_t);
-	D_ASSERT(blob_start < blob_end);
+
+	//! Every bitmap takes at least its key, so the declared count is bounded by the bytes before the checksum
+	auto remaining_bytes = NumericCast<idx_t>(vector_end - blob_start);
+	if (amount_of_bitmaps < 0 || NumericCast<idx_t>(amount_of_bitmaps) > remaining_bytes / sizeof(int32_t)) {
+		throw InvalidInputException("Invalid bitmap count (%d) in deletion vector of %d bytes, the DeletionVector is "
+		                            "corrupted",
+		                            amount_of_bitmaps, blob_length);
+	}
 
 	auto result_p = make_shared_ptr<IcebergDeletionVectorData>(file);
 	auto &result = *result_p;
 	result.bitmaps.reserve(amount_of_bitmaps);
 	for (int64_t i = 0; i < amount_of_bitmaps; i++) {
+		if (NumericCast<idx_t>(vector_end - blob_start) < sizeof(int32_t)) {
+			throw InvalidInputException("Deletion vector is truncated, the DeletionVector is corrupted");
+		}
 		auto key = Load<int32_t>(blob_start);
 		blob_start += sizeof(int32_t);
-		vector_size -= sizeof(int32_t);
-		D_ASSERT(blob_start < blob_end);
 
+		//! roaring reads at most the bytes before the checksum, and returns 0 if no valid bitmap fits in them
+		auto available = NumericCast<idx_t>(vector_end - blob_start);
 		size_t bitmap_size =
-		    roaring::api::roaring_bitmap_portable_deserialize_size((const char *)blob_start, vector_size);
-		auto bitmap = roaring::Roaring::readSafe((const char *)blob_start, bitmap_size);
+		    roaring::api::roaring_bitmap_portable_deserialize_size((const char *)blob_start, available);
+		if (bitmap_size == 0) {
+			throw InvalidInputException("Invalid bitmap in deletion vector, the DeletionVector is corrupted");
+		}
+		//! readSafe throws a plain std::runtime_error when it fails, so call the C function and check for NULL
+		auto bitmap_p = roaring::api::roaring_bitmap_portable_deserialize_safe((const char *)blob_start, bitmap_size);
+		if (!bitmap_p) {
+			throw InvalidInputException("Invalid bitmap in deletion vector, the DeletionVector is corrupted");
+		}
+		roaring::Roaring bitmap(bitmap_p);
 		blob_start += bitmap_size;
-		vector_size -= bitmap_size;
-		D_ASSERT(blob_start < blob_end);
 		result.bitmaps.emplace(key, std::move(bitmap));
 	}
-	//! Compute and compare the checksum
+	//! The bitmaps must fill the blob up to the checksum
+	if (blob_start != vector_end) {
+		throw InvalidInputException("Deletion vector has %d bytes after its bitmaps, the DeletionVector is corrupted",
+		                            NumericCast<idx_t>(vector_end - blob_start));
+	}
+
+	//! Compute and compare the checksum, the last 4 bytes of the blob
 	auto checksummed_data_length = blob_start - checksummed_data_start;
 	auto stored_checksum = BSwap(Load<uint32_t>(blob_start));
-	blob_start += sizeof(uint32_t);
-	D_ASSERT(blob_start == blob_end);
 
 	CRC32 crc;
 	crc.Update(checksummed_data_start, checksummed_data_length);
@@ -260,71 +286,6 @@ vector<data_t> IcebergDeletionVectorData::ToBlob(const unordered_map<int32_t, ro
 	// Write CRC checksum (placeholder - set to 0)
 	Store<uint32_t>(BSwap(checksum), blob_ptr);
 	return blob_output;
-}
-
-vector<data_t> IcebergDeletionVectorData::ToPuffinFile(const vector<data_t> &blob, const string &referenced_data_file,
-                                                       idx_t cardinality) {
-	//! Wrap a `deletion-vector-v1` blob in a valid Puffin file container.
-	//! https://iceberg.apache.org/puffin-spec/
-	//! File layout:   Magic | Blob | Footer
-	//! Footer layout: Magic | FooterPayload (JSON) | FooterPayloadSize (4 bytes, little-endian) |
-	//!                Flags (4 bytes) | Magic
-	constexpr data_t PUFFIN_MAGIC[4] = {0x50, 0x46, 0x41, 0x31}; //! "PFA1"
-	const idx_t blob_offset = sizeof(PUFFIN_MAGIC);
-
-	//! Build the FooterPayload (FileMetadata). Per the spec, for `deletion-vector-v1` the blob's
-	//! `snapshot-id` and `sequence-number` must be -1, and it must carry the `referenced-data-file`
-	//! and `cardinality` properties. The blob is not compressed (no `compression-codec`).
-	JSONWriter writer;
-	auto root = writer.CreateObject();
-	writer.SetRoot(root);
-	auto blobs = writer.CreateArray();
-	root.Add("blobs", blobs);
-	auto blob_meta = writer.CreateObject();
-	blobs.Append(blob_meta);
-	blob_meta.AddString("type", "deletion-vector-v1");
-	blob_meta.Add("fields", writer.CreateArray());
-	blob_meta.Add("snapshot-id", writer.CreateSignedInteger(-1));
-	blob_meta.Add("sequence-number", writer.CreateSignedInteger(-1));
-	blob_meta.Add("offset", writer.CreateSignedInteger(static_cast<int64_t>(blob_offset)));
-	blob_meta.Add("length", writer.CreateSignedInteger(static_cast<int64_t>(blob.size())));
-	auto props = writer.CreateObject();
-	blob_meta.Add("properties", props);
-	props.AddString("referenced-data-file", referenced_data_file);
-	props.AddString("cardinality", std::to_string(cardinality));
-	auto footer_payload = writer.ToString(JSONWriteFlags::ALLOW_INF_AND_NAN);
-
-	const idx_t footer_payload_size = footer_payload.size();
-	const idx_t total_size = blob_offset + blob.size() + sizeof(PUFFIN_MAGIC) + footer_payload_size +
-	                         sizeof(int32_t) /* FooterPayloadSize */ + sizeof(uint32_t) /* Flags */ +
-	                         sizeof(PUFFIN_MAGIC);
-
-	vector<data_t> file_output;
-	file_output.resize(total_size);
-	data_ptr_t ptr = file_output.data();
-
-	//! Magic
-	memcpy(ptr, PUFFIN_MAGIC, sizeof(PUFFIN_MAGIC));
-	ptr += sizeof(PUFFIN_MAGIC);
-	//! Blob (starts at blob_offset == 4)
-	memcpy(ptr, blob.data(), blob.size());
-	ptr += blob.size();
-	//! Footer: leading Magic
-	memcpy(ptr, PUFFIN_MAGIC, sizeof(PUFFIN_MAGIC));
-	ptr += sizeof(PUFFIN_MAGIC);
-	//! Footer: FooterPayload (uncompressed UTF-8 JSON)
-	memcpy(ptr, footer_payload.c_str(), footer_payload_size);
-	ptr += footer_payload_size;
-	//! Footer: FooterPayloadSize (4-byte signed int, little-endian)
-	Store<int32_t>(static_cast<int32_t>(footer_payload_size), ptr);
-	ptr += sizeof(int32_t);
-	//! Footer: Flags (4 bytes; bit 0 of byte 0 = FooterPayload compressed -> 0 == uncompressed)
-	Store<uint32_t>(0, ptr);
-	ptr += sizeof(uint32_t);
-	//! Footer: trailing Magic
-	memcpy(ptr, PUFFIN_MAGIC, sizeof(PUFFIN_MAGIC));
-
-	return file_output;
 }
 
 } // namespace duckdb

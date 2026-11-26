@@ -1,10 +1,13 @@
 #pragma once
 
+#include "planning/iceberg_file_secret.hpp"
+
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/optional.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
@@ -53,6 +56,11 @@ public:
 	bool Complete() const {
 		return FilesComplete() && RowsComplete();
 	}
+	//! True only when the counts prove the manifest holds nothing but DELETED entries. Unknown counts
+	//! (optional in V1 manifest lists) are treated as possibly non-zero.
+	bool HasNoLiveFiles() const {
+		return added_files_count && existing_files_count && *added_files_count == 0 && *existing_files_count == 0;
+	}
 
 public:
 	optional<idx_t> added_files_count;
@@ -80,6 +88,12 @@ public:
 	static IcebergManifestMetadata FromTableMetadata(const IcebergTableMetadata &table_metadata,
 	                                                 IcebergManifestContentType content,
 	                                                 optional<int32_t> partition_spec_id = nullopt);
+	//! The metadata of a manifest file, read from its Avro key-value metadata. 'path' names the manifest in errors.
+	//! 'manifest_list_spec_id' is the partition spec id the manifest list records for the manifest: a v1 manifest
+	//! without 'partition-spec-id' is read with the table's spec whose fields match its own 'partition-spec'.
+	static IcebergManifestMetadata FromAvroMetadata(const InsertionOrderPreservingMap<Value> &metadata,
+	                                                const string &path, const IcebergTableMetadata &table_metadata,
+	                                                int32_t manifest_list_spec_id);
 
 public:
 	const int32_t schema_id;
@@ -131,7 +145,8 @@ struct IcebergManifestFile : public IcebergManifest {
 	}
 
 	//! Resolve inherited identities against this file before moving entries into a replacement.
-	//! ADDED entries become EXISTING; explicit identities and previously DELETED entries are preserved.
+	//! ADDED entries become EXISTING and explicit identities are preserved. Previously DELETED entries are
+	//! dropped: a tombstone belongs only to the snapshot that deleted the file (Apache Iceberg semantics).
 	vector<IcebergManifestEntry> PrepareEntriesForRewrite(vector<IcebergManifestEntry> entries) const;
 
 	string manifest_path;
@@ -153,6 +168,9 @@ public:
 		if (this != &other) {
 			manifest = other.manifest;
 			manifest_entries = other.manifest_entries;
+			shared_entries = other.shared_entries;
+			parsed_manifest = other.parsed_manifest;
+			manifest_header = other.manifest_header;
 			if (other.manifest_metadata) {
 				manifest_metadata.reset();
 				manifest_metadata.emplace(*other.manifest_metadata);
@@ -166,6 +184,9 @@ public:
 		if (this != &other) {
 			manifest = std::move(other.manifest);
 			manifest_entries = std::move(other.manifest_entries);
+			shared_entries = std::move(other.shared_entries);
+			parsed_manifest = std::move(other.parsed_manifest);
+			manifest_header = std::move(other.manifest_header);
 			if (other.manifest_metadata) {
 				manifest_metadata.reset();
 				manifest_metadata.emplace(*other.manifest_metadata);
@@ -183,22 +204,15 @@ public:
 	                                              const IcebergManifestMetadata &manifest_metadata,
 	                                              vector<IcebergManifestEntry> entries);
 	bool HasManifestEntries() const {
-		return manifest_entries.has_value();
+		return manifest_entries.has_value() || shared_entries != nullptr || parsed_manifest != nullptr;
 	}
-	vector<IcebergManifestEntry> &GetManifestEntries() {
-		D_ASSERT(manifest_entries);
-		return *manifest_entries;
-	}
-	const vector<IcebergManifestEntry> &GetManifestEntries() const {
-		D_ASSERT(manifest_entries);
-		return *manifest_entries;
-	}
-	vector<IcebergManifestEntry> &GetOrCreateManifestEntries() {
-		if (!manifest_entries) {
-			manifest_entries.emplace();
-		}
-		return *manifest_entries;
-	}
+	const vector<IcebergManifestEntry> &GetManifestEntries() const;
+	//! Explicit copy-on-write; readers never detach the shared payload.
+	vector<IcebergManifestEntry> &GetOrCreateManifestEntries();
+	vector<IcebergManifestEntry> TakeManifestEntries();
+	//! Retain scan ownership while constructing a cache payload, including on failure.
+	shared_ptr<const vector<IcebergManifestEntry>> ShareManifestEntries();
+	void ResetManifestEntries();
 
 public:
 	bool HasFile() const {
@@ -218,8 +232,13 @@ public:
 	}
 	optional<IcebergManifestMetadata> manifest_metadata;
 	optional<vector<IcebergManifestEntry>> manifest_entries;
+	//! Only completed, unbound content is shared. The descriptor above stays scan-local.
+	shared_ptr<const class IcebergParsedManifest> parsed_manifest;
+	InsertionOrderPreservingMap<Value> manifest_header;
 
 private:
+	shared_ptr<const vector<IcebergManifestEntry>> shared_entries;
+
 	IcebergManifestListEntry(IcebergManifest manifest, IcebergManifestMetadata metadata,
 	                         vector<IcebergManifestEntry> entries)
 	    : manifest_metadata(std::move(metadata)), manifest_entries(std::move(entries)), manifest(std::move(manifest)) {
@@ -253,10 +272,11 @@ public:
 	static LogicalType FieldSummaryType();
 	static Value FieldSummaryFieldIds();
 	static void LoadManifestFiles(const IcebergSnapshotScanInfo &snapshot_info, const IcebergTableMetadata &metadata,
-	                              ClientContext &context, vector<IcebergManifestListEntry> &result);
+	                              ClientContext &context, vector<IcebergManifestListEntry> &result,
+	                              IcebergFileSecret file_secret = {});
 	static unique_ptr<IcebergManifestList> Load(const string &iceberg_path, const IcebergTableMetadata &metadata,
 	                                            const IcebergSnapshotScanInfo &snapshot_info, ClientContext &context,
-	                                            const IcebergOptions &options);
+	                                            const IcebergOptions &options, IcebergFileSecret file_secret = {});
 
 private:
 	string path;

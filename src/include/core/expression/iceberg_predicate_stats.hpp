@@ -19,9 +19,14 @@ public:
 	static IcebergPredicateStats DeserializeBounds(ClientContext &context, const Value &lower_bound,
 	                                               const Value &upper_bound, const string &name,
 	                                               const LogicalType &type);
+	static IcebergPredicateStats DeserializeBoundsForPruning(ClientContext &context, const Value &lower_bound,
+	                                                         const Value &upper_bound, const string &name,
+	                                                         const LogicalType &type);
 	void SetLowerBound(const Value &new_lower_bound);
 	void SetUpperBound(const Value &new_upper_bound);
 	bool BoundsAreNull() const;
+	bool HasMissingOrNullBounds() const;
+	shared_ptr<BaseStatistics> BuildColumnStats(const LogicalType &type) const;
 
 public:
 	optional<Value> lower_bound;

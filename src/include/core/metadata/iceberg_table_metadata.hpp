@@ -23,6 +23,8 @@ const string WRITE_MERGE_MODE = "write.merge.mode";
 const string WRITE_DELETE_ISOLATION_LEVEL = "write.delete.isolation-level";
 const string WRITE_FORMAT_DEFAULT = "write.format.default";
 const string WRITE_DELETE_FORMAT_DEFAULT = "write.delete.format.default";
+const string WRITE_PARQUET_COMPRESSION_CODEC = "write.parquet.compression-codec";
+const string WRITE_DELETE_PARQUET_COMPRESSION_CODEC = "write.delete.parquet.compression-codec";
 
 struct IcebergMetadataLogItem {
 public:
@@ -35,10 +37,34 @@ public:
 	timestamp_ms_t timestamp_ms;
 };
 
+//! One blob of a table statistics file, as listed in the table metadata ("blob-metadata")
+struct IcebergStatisticsBlob {
+public:
+	string type;
+	int64_t snapshot_id = 0;
+	int64_t sequence_number = 0;
+	vector<int32_t> fields;
+	unordered_map<string, string> properties;
+};
+
+//! A table statistics file (Puffin), one entry of the table metadata's "statistics" list
+struct IcebergStatisticsFile {
+public:
+	//! The number of distinct values of the field, when the file records a theta sketch for it
+	optional<int64_t> GetDistinctCount(int32_t field_id) const;
+
+public:
+	int64_t snapshot_id = 0;
+	string path;
+	int64_t file_size_in_bytes = 0;
+	int64_t file_footer_size_in_bytes = 0;
+	vector<IcebergStatisticsBlob> blobs;
+};
+
 struct IcebergTableMetadataSchemas {
 public:
 	IcebergTableMetadataSchemas() = default;
-	explicit IcebergTableMetadataSchemas(unordered_map<int32_t, shared_ptr<IcebergTableSchema>> schemas_p)
+	explicit IcebergTableMetadataSchemas(unordered_map<int32_t, shared_ptr<const IcebergTableSchema>> schemas_p)
 	    : schemas(std::move(schemas_p)) {
 		for (auto &[_, schema] : schemas) {
 			if (!schema) {
@@ -52,11 +78,11 @@ public:
 	const IcebergTableSchema &GetSchemaFromId(int32_t schema_id) const;
 	void ForEachSchema(const std::function<void(const IcebergTableSchema &)> &callback) const;
 	bool IsEmpty() const;
-	IcebergTableSchema &AddSchemaOrGetExisting(shared_ptr<IcebergTableSchema> schema);
+	const IcebergTableSchema &AddSchemaOrGetExisting(shared_ptr<IcebergTableSchema> schema);
 
 private:
 	//! schema_id -> schema
-	unordered_map<int32_t, shared_ptr<IcebergTableSchema>> schemas;
+	unordered_map<int32_t, shared_ptr<const IcebergTableSchema>> schemas;
 };
 
 //! A structure to store "LoadTableResult" information that changes as a transaction goes on
@@ -70,7 +96,8 @@ public:
 	IcebergTableMetadata &operator=(IcebergTableMetadata &&) = default;
 
 public:
-	static rest_api_objects::TableMetadata Parse(const string &path, FileSystem &fs,
+	//! Opens `file` with its extended information, such as its named secret
+	static rest_api_objects::TableMetadata Parse(const OpenFileInfo &file, FileSystem &fs,
 	                                             const string &metadata_compression_codec);
 	static IcebergTableMetadata FromTableMetadata(const rest_api_objects::TableMetadata &table_metadata);
 	IcebergTableMetadata Copy() const;
@@ -103,6 +130,7 @@ public:
 	optional_ptr<const IcebergColumnDefinition> FindColumnByFieldId(int32_t field_id) const;
 	optional_ptr<const IcebergPartitionSpec> FindPartitionSpecById(int32_t spec_id) const;
 	optional_ptr<const IcebergSortOrder> FindSortOrderById(int32_t sort_id) const;
+	optional_ptr<const IcebergStatisticsFile> FindStatisticsFile(int64_t snapshot_id) const;
 	IcebergSnapshotScanInfo GetSnapshot(const IcebergSnapshotLookup &lookup) const;
 
 	const string &GetLocation() const;
@@ -117,6 +145,10 @@ public:
 
 	const case_insensitive_map_t<string> &GetTableProperties() const;
 	string GetTableProperty(string property_string) const;
+	//! Whether the given write mode property is explicitly set to copy-on-write
+	bool UsesCopyOnWrite(const string &write_mode_property) const;
+	static void VerifyNotReservedProperty(const string &key, const string &operation);
+	string GetDeleteCompressionCodec() const;
 	//! Whether the given write mode property (write.delete.mode, write.update.mode or write.merge.mode) allows
 	//! writing merge-on-read delete files
 	bool AllowsMergeOnRead(const string &write_mode_property) const;
@@ -164,6 +196,7 @@ public:
 	//! snapshot_id -> snapshot
 	unordered_map<int64_t, IcebergSnapshot> snapshots;
 	//! Branch and tag references, including their optional retention settings
+	//! An absent value denotes legacy implicit main; an explicit empty map does not.
 	optional<rest_api_objects::SnapshotReferences> refs;
 	//! History of refs.main per Iceberg spec "snapshot-log": (snapshot_id, raw millis)
 	//! pairs recording each change to current-snapshot-id, sorted ascending by ms.
@@ -171,6 +204,8 @@ public:
 	//! Stored as raw millis (matching the REST API representation and last_updated_ms)
 	//! to keep all timestamp comparisons in a single unit.
 	vector<pair<int64_t /*snapshot_id*/, timestamp_ms_t>> snapshot_log;
+	//! Table statistics files, at most one per snapshot
+	vector<IcebergStatisticsFile> statistics;
 	vector<IcebergFieldMapping> mappings;
 
 	//! Custom write paths from table properties

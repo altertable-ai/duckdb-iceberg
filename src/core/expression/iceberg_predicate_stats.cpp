@@ -2,10 +2,16 @@
 
 #include "core/expression/iceberg_value.hpp"
 #include "duckdb/common/types/geometry.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/geometry_stats.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "iceberg_logging.hpp"
+
+#include <limits>
 
 namespace duckdb {
 
@@ -19,6 +25,10 @@ void IcebergPredicateStats::SetUpperBound(const Value &new_upper_bound) {
 
 bool IcebergPredicateStats::BoundsAreNull() const {
 	return lower_bound && upper_bound && lower_bound->IsNull() && upper_bound->IsNull();
+}
+
+bool IcebergPredicateStats::HasMissingOrNullBounds() const {
+	return !lower_bound || !upper_bound || lower_bound->IsNull() || upper_bound->IsNull();
 }
 
 static shared_ptr<BaseStatistics> BuildGeometryStats(const Value &lower_bound, const Value &upper_bound,
@@ -51,6 +61,65 @@ static shared_ptr<BaseStatistics> BuildGeometryStats(const Value &lower_bound, c
 		extent.m_max = hi[3];
 	}
 	return stats;
+}
+
+shared_ptr<BaseStatistics> IcebergPredicateStats::BuildColumnStats(const LogicalType &type) const {
+	//! A file written before a type promotion keeps bounds of the old type, e.g. INTEGER bounds for a column that is
+	//! now BIGINT. Core reads the statistics as the column's type, so the bounds are cast to it.
+	optional<Value> lower, upper;
+	if (lower_bound && !lower_bound->IsNull()) {
+		lower = lower_bound->DefaultTryCastAs(type);
+		if (!lower) {
+			return nullptr;
+		}
+	}
+	if (upper_bound && !upper_bound->IsNull()) {
+		upper = upper_bound->DefaultTryCastAs(type);
+		if (!upper) {
+			return nullptr;
+		}
+	}
+	switch (BaseStatistics::GetStatsType(type)) {
+	case StatisticsType::NUMERIC_STATS: {
+		auto stats = NumericStats::CreateEmpty(type);
+		if (lower) {
+			NumericStats::SetMin(stats, *lower);
+		}
+		if (upper) {
+			NumericStats::SetMax(stats, *upper);
+		}
+		if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+			//! Iceberg float bounds exclude NaN, which core zonemaps order as the largest value
+			if (!has_nan || *has_nan) {
+				NumericStats::SetMax(stats, type.id() == LogicalTypeId::FLOAT
+				                                ? Value::FLOAT(std::numeric_limits<float>::quiet_NaN())
+				                                : Value::DOUBLE(std::numeric_limits<double>::quiet_NaN()));
+			}
+		}
+		if (has_null) {
+			stats.SetHasNull();
+		}
+		if (has_not_null) {
+			stats.SetHasNoNull();
+		}
+		return make_shared_ptr<BaseStatistics>(std::move(stats));
+	}
+	case StatisticsType::STRING_STATS: {
+		auto stats = StringStats::CreateUnknown(type);
+		//! Iceberg string bounds may be truncated
+		if (lower) {
+			StringStats::SetMin(stats, lower->GetValueUnsafe<string_t>(), StringStatsType::TRUNCATED_STATS);
+		}
+		if (upper) {
+			StringStats::SetMax(stats, upper->GetValueUnsafe<string_t>(), StringStatsType::TRUNCATED_STATS);
+		}
+		stats.Set(has_null ? StatsInfo::CAN_HAVE_NULL_VALUES : StatsInfo::CANNOT_HAVE_NULL_VALUES);
+		stats.Set(has_not_null ? StatsInfo::CAN_HAVE_VALID_VALUES : StatsInfo::CANNOT_HAVE_VALID_VALUES);
+		return make_shared_ptr<BaseStatistics>(std::move(stats));
+	}
+	default:
+		return nullptr;
+	}
 }
 
 IcebergPredicateStats IcebergPredicateStats::DeserializeBounds(ClientContext &context, const Value &lower_bound,
@@ -91,6 +160,34 @@ IcebergPredicateStats IcebergPredicateStats::DeserializeBounds(ClientContext &co
 		}
 	}
 	return result;
+}
+
+IcebergPredicateStats IcebergPredicateStats::DeserializeBoundsForPruning(ClientContext &context, const Value &lower,
+                                                                         const Value &upper, const string &name,
+                                                                         const LogicalType &type) {
+	auto stats = DeserializeBounds(context, lower, upper, name, type);
+	if (type.id() != LogicalTypeId::UUID) {
+		return stats;
+	}
+	// Writers may compare UUIDs as two signed longs (Iceberg Java) or as unsigned bytes (DuckDB).
+	// A single endpoint, or a signed interval that wraps around the high word, gives no usable bounds.
+	if (!stats.lower_bound || !stats.upper_bound) {
+		return {};
+	}
+	auto lo = BaseUUID::ToUHugeint(stats.lower_bound->GetValueUnsafe<hugeint_t>());
+	auto hi = BaseUUID::ToUHugeint(stats.upper_bound->GetValueUnsafe<hugeint_t>());
+	if (lo.upper > hi.upper) {
+		return {};
+	}
+	if (lo.upper != hi.upper || lo.lower > hi.lower) {
+		// Both orders stay within these high words. At either end, signed low-word extrema
+		// can exclude real values in unsigned order, even if the two endpoints look ordered.
+		lo.lower = 0;
+		hi.lower = NumericLimits<uint64_t>::Maximum();
+		stats.SetLowerBound(Value::UUID(BaseUUID::FromUHugeint(lo)));
+		stats.SetUpperBound(Value::UUID(BaseUUID::FromUHugeint(hi)));
+	}
+	return stats;
 }
 
 } // namespace duckdb

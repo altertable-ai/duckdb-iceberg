@@ -5,7 +5,9 @@ The native catalog implements the Python mock's REST contract in the separate
 Iceberg still constructs requests, serializes commits, parses responses, logs
 HTTP requests, and runs normal retry logic.
 Requests to `http://iceberg-mock.invalid` never open a socket. Once enabled,
-other HTTP origins are rejected.
+other HTTP origins are rejected unless explicitly registered with the optional
+`origins` list in `iceberg_test_catalog_init`. Registered origins use the same
+in-process catalog, allowing tests to exercise hostname-based catalog detection.
 HTTP filesystem sessions are rejected before HTTPFS consumes transport parameters;
 warehouse reads and writes use local files.
 
@@ -48,12 +50,84 @@ Unlike the Python config, it does not skip unexpected unsupported errors.
 Filters use repository-relative paths so each test runs once and the config's
 relative skip paths also apply on Windows.
 
+DuckDB's core CI registers `test/sql/local/native_catalog` with
+`test/configs/mock_native.json` as its scoped `TEST_CONFIG`. It includes
+`test/native_catalog/extension_config.cmake` to build the mock and builds Avro
+alongside Iceberg in the cloud extension group. Core CI sets
+`ICEBERG_MOCK_BUILD_LOADABLE=OFF` and links the mock statically into its test build,
+so it is not published with the cloud extensions. Iceberg and its dependencies
+are also linked to support the credential callback tests. These tests run through
+the ordinary core test runner without invoking this repository's Makefile.
+The config applies only to the registered native tests; other extensions keep
+their own test setup. WebAssembly and the deployment autoloading checks do not
+register the native suite.
+
 The standalone API tests exercise independent database lifetimes and publication
 failure after completing the first file of a multi-table commit:
 
 ```sh
 cmake --build build/reldebug --target unittest_iceberg_native
 ./build/reldebug/test/unittest_iceberg_native
+```
+
+The separate scan serialization API executable links Iceberg and exercises its callbacks
+directly, so optimizer fallback cannot hide a failed round trip:
+
+```sh
+./build/reldebug/test/unittest_iceberg_serialization
+```
+
+The CI build step also runs these serialization tests before packaging the SQL
+test runner.
+
+The LoadTable cache API tests deterministically interleave request construction,
+publication, and eviction, and check the credential-refresh fallback. They also
+cover expired Azure SAS credentials and S3 credential refresh after an HTTP 304,
+without contacting cloud storage. Parsed metadata cases check response-generation
+identity, concurrent initialization, owner release after replacement, and
+copy-on-write isolation from readers. Authoritative-file fallback is retried, and
+historical metadata-log reconstruction keeps a separate owner from the cached
+head:
+
+```sh
+./build/reldebug/test/unittest_iceberg_cache
+```
+
+The CI build step runs these tests alongside the other API executables.
+
+The planning API tests check borrowed and extracted filter lifetimes and filtered
+views sharing a provider. They also check invalidation of cached missing paths.
+Delete-index cases compare indexed and exhaustive applicability, cover null/NaN
+and composite partitions, original paths and Puffin offsets, and drive concurrent
+views. A gated filesystem holds a lazy manifest read until an overlapping caller
+has registered, checking atomic publication, retained index ownership, and shared
+I/O/cancellation errors. The delete file cases hold the claiming worker in the open
+of one delete file and check that a waiting worker or an async thread reads the
+others, and that a failed read reaches both. The equality-delete view cases require
+equality-delete writes:
+
+```sh
+./build/reldebug/test/unittest_iceberg_planning
+```
+
+Parsed-manifest cases check shared entry addresses, list-specific inheritance,
+copy-on-write rewrites, key compatibility, eviction, interleaved misses and
+failed publication without invalidating streamed references. Frozen partition
+indexes are also probed after the creating connection closes.
+`test/sql/local/native_catalog/parsed_manifest_cache.test` checks cold/warm
+counters, selective then broader scans, dynamic filters, new snapshots,
+rollback, ETag/304 and early LIMIT cleanup. The standalone
+`test/sql/local/iceberg_scans/parsed_manifest_cache.test` covers warm v1 header
+fallback and day partition values.
+
+CI runs these tests in both the assertion build and the release build. The release
+build enables equality-delete writes, so the shared-provider case executes there.
+
+Run the ETag SQL tests with the native mock config:
+
+```sh
+./build/reldebug/test/unittest --test-config test/configs/mock_native.json \
+  'test/sql/local/native_catalog/load_table_etag*'
 ```
 
 ## SQL test interfaces
@@ -80,9 +154,9 @@ FROM iceberg_test_catalog_request('GET', '/v1/config', NULL);
 ```
 
 Initialization loads HTTPFS before installing the native provider. Repeating it
-with the same root is a no-op; supplying another root is an error. The root must
-be a local directory. Each database creates a unique child directory containing
-its warehouse and a bounded-payload `requests.jsonl` journal. Metadata files
+with the same root can register additional origins; supplying another root is an
+error. The root must be a local directory. Each database creates a unique child
+directory containing its warehouse and a bounded-payload `requests.jsonl` journal. Metadata files
 remain complete and immutable. The test runner owns cleanup.
 
 All connections in one `DatabaseInstance` share catalog state, even after the
@@ -98,8 +172,9 @@ not during binding or EXPLAIN.
 
 Client protocol tests can install an exact response with
 `POST /__test/response`, supplying a JSON object with `method`, `path`, `status`,
-and `body`. The path includes the query string. The response replaces that route
-until overwritten or cleared with `DELETE /__test/response`, which clears all
+and `body`, plus an optional `headers` object. The path includes the query string.
+The response replaces that route until overwritten or cleared with
+`DELETE /__test/response`, which clears all
 scripted responses. This permits config and auth tests without external servers;
 the normal catalog model handles all other routes.
 

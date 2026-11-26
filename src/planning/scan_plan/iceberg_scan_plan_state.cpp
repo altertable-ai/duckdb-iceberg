@@ -36,12 +36,22 @@ void IcebergScanPlanState::SetTable(IcebergTableSchemaVersion &table) {
 	configuration.table = table;
 }
 
+//! The two restrictions the planner hook asks for. A prepared statement is planned again on every EXECUTE, with the
+//! bind data of the PREPARE, so the hook asks a second time, after the first plan froze the configuration: a request
+//! that changes nothing is not a change.
+
 void IcebergScanPlanState::DisableServerSidePlanning() {
+	if (!configuration.server_side_planning_enabled) {
+		return;
+	}
 	RequireConfigurable();
 	configuration.server_side_planning_enabled = false;
 }
 
 void IcebergScanPlanState::RequireRowIds() {
+	if (configuration.row_ids_required) {
+		return;
+	}
 	RequireConfigurable();
 	configuration.row_ids_required = true;
 }
@@ -55,6 +65,15 @@ void IcebergScanPlanState::FreezeConfiguration() {
 
 IcebergScanPlanState::~IcebergScanPlanState() = default;
 
+IcebergEqualityDeleteBounds &IcebergScanPlanState::GetEqualityDeleteBounds(idx_t manifest_idx, idx_t entry_idx) {
+	lock_guard<mutex> guard(equality_bounds_lock);
+	auto &bounds = equality_delete_bounds[manifest_idx][entry_idx];
+	if (!bounds) {
+		bounds = make_uniq<IcebergEqualityDeleteBounds>();
+	}
+	return *bounds;
+}
+
 IcebergScanPlanProvider &IcebergScanPlanState::GetScanPlanProvider(const IcebergTableFilters &filters,
                                                                    const IcebergScanOrder &scan_order) {
 	if (!scan_plan_provider) {
@@ -67,7 +86,8 @@ IcebergScanPlanProvider &IcebergScanPlanState::GetScanPlanProvider(const Iceberg
 		                                     scan_info.snapshot_info,
 		                                     scan_info.metadata,
 		                                     scan_info.schema,
-		                                     scan_info.transaction_data.get()};
+		                                     scan_info.transaction_data.get(),
+		                                     scan_info.file_secret};
 		scan_plan_provider =
 		    IcebergScanPlanProvider::Create(*this, std::move(plan_context), configuration.table, filters, scan_order,
 		                                    configuration.server_side_planning_enabled);

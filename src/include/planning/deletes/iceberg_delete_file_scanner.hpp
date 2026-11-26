@@ -1,5 +1,7 @@
 #pragma once
 
+#include "planning/iceberg_file_secret.hpp"
+
 #include "core/deletes/iceberg_delete_data.hpp"
 #include "core/deletes/iceberg_equality_delete.hpp"
 #include "core/deletes/iceberg_delete_file.hpp"
@@ -23,7 +25,10 @@ struct IcebergDeleteExecutionContext {
 	const string &table_path;
 	const IcebergOptions &options;
 	const IcebergTableMetadata &metadata;
+	IcebergFileSecret file_secret;
 };
+
+class TaskExecutor;
 
 //! Contents are immutable after publication through complete under lock.
 //! Execution state for one delete file. This deliberately lives outside scan
@@ -35,6 +40,9 @@ struct IcebergDeleteFileLoadState {
 	ErrorData error;
 	shared_ptr<IcebergEqualityDeleteFile> equality_delete;
 	position_delete_map_t positional_deletes;
+	//! The read tasks of the claim this delete file is part of, until the file was read. Set by the claiming
+	//! worker before the load is visible to other workers, guarded by lock afterwards.
+	shared_ptr<TaskExecutor> read_tasks;
 };
 
 //! A selected descriptor and the load state exclusively populated by its builder.
@@ -65,6 +73,12 @@ struct IcebergDeleteFileScanner {
 //! Materialized delete contents and synchronization for executing planned tasks.
 //! The scan planner only selects descriptors; this state reads and caches them.
 class IcebergDeleteExecutionState {
+	friend struct IcebergDeleteExecutionStateTest;
+
+public:
+	//! The delete files a worker claims are read in tasks of at most this many
+	static constexpr idx_t DELETE_FILES_PER_READ_TASK = 4;
+
 public:
 	IcebergDeletePlan ProcessDeletes(const IcebergDeleteExecutionContext &context, const string &data_file_path,
 	                                 const vector<IcebergDeleteFile> &descriptors);

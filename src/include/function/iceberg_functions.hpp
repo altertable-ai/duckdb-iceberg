@@ -31,6 +31,7 @@ private:
 	static TableFunctionSet GetIcebergHistoryFunction();
 	static TableFunctionSet GetIcebergRefsFunction();
 	static TableFunctionSet GetIcebergPartitionSpecsFunction();
+	static TableFunctionSet GetIcebergSchemasFunction();
 	static TableFunctionSet GetIcebergPartitionsFunction();
 	static TableFunctionSet GetIcebergScanFunction(ExtensionLoader &loader);
 	static TableFunctionSet GetIcebergMetadataFunction();
@@ -47,8 +48,10 @@ private:
 	static TableFunctionSet GetIcebergSchemaPropertiesFunctions();
 	static TableFunctionSet SetIcebergSchemaPropertiesFunctions();
 	static TableFunctionSet RemoveIcebergSchemaPropertiesFunctions();
+	static TableFunctionSet GetIcebergExpireSnapshotsFunction();
 	static TableFunctionSet GetIcebergRewriteDataFilesFunction();
 	static TableFunctionSet GetIcebergRollbackToSnapshotFunction();
+	static TableFunctionSet GetIcebergMoveColumnFunction();
 };
 
 } // namespace duckdb

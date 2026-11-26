@@ -7,6 +7,7 @@
 #include "catalog/rest/catalog_entry/schema/iceberg_schema_entry.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
 #include "catalog/rest/iceberg_catalog.hpp"
+#include "catalog/rest/transaction/iceberg_transaction.hpp"
 #include "execution/operator/iceberg_insert.hpp"
 
 namespace duckdb {
@@ -41,6 +42,7 @@ void IcebergCopyToFile::ApplyCopyOptions(IcebergCopyOptions &copy_options) {
 	names = std::move(copy_options.names);
 	expected_types = std::move(copy_options.expected_types);
 	hive_file_pattern = copy_options.partitioned_paths;
+	partition_path_expression = std::move(copy_options.partition_path_expression);
 	// PlanCopyForInsert moves these out into a PhysicalOrder when the write is not partitioned, leaving an
 	// empty vector here; for a partitioned write the copy operator sorts within each partition itself.
 	order_columns = std::move(copy_options.order_columns);
@@ -71,7 +73,13 @@ void IcebergCopyToFile::EnsureTableCreated(ClientContext &context) const {
 	auto &catalog = schema_entry.catalog;
 	auto transaction = catalog.GetCatalogTransaction(context);
 
-	auto table = schema_entry.CreateTable(transaction, context, *op.ctas_info);
+	optional_ptr<CatalogEntry> table;
+	{
+		//! The table is created while the statement runs: another operator or table function of the statement may
+		//! change tables of this transaction at the same time
+		lock_guard<mutex> table_update_guard(IcebergTransaction::Get(context, catalog).table_update_lock);
+		table = schema_entry.CreateTable(transaction, context, *op.ctas_info);
+	}
 	if (!table) {
 		throw InternalException("Iceberg CTAS: CreateTable request failed");
 	}
@@ -81,7 +89,7 @@ void IcebergCopyToFile::EnsureTableCreated(ClientContext &context) const {
 	// Load any per-table credentials (e.g. SigV4 for the data location).
 	ic_table.PrepareIcebergScanFromEntry(context);
 
-	auto &table_metadata = ic_table.table_info.table_metadata;
+	auto &table_metadata = ic_table.table_info.GetMetadata();
 	auto &table_schema = table_metadata.GetLatestSchema();
 
 	// Replace the plan-time options, which were derived from placeholder metadata without a location.

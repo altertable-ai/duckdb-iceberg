@@ -149,6 +149,24 @@
       ]
     },
     {
+      "reason": "Requires HTTPFS to be absent, but fixture initialization loads it for catalog and storage access",
+      "paths": [
+        "test/sql/extensions/extension_repository_from_host_no_httpfs.test"
+      ]
+    },
+    {
+      "reason": "Casts catalog and schema names to INTEGER assuming only its numeric-named tables exist; the fixture exposes additional tables under my_datalake",
+      "paths": [
+        "test/sql/catalog/system_functions/system_catalog_scanner_fallible_filters.test"
+      ]
+    },
+    {
+      "reason": "Parquet page-index logging counts only the direct file scan; COPY from its Iceberg-backed source adds another ParquetReader ReadRowGroup event",
+      "paths": [
+        "test/sql/copy/parquet/page_index/page_index_read.test"
+      ]
+    },
+    {
       "reason": "requires json support",
       "paths": [
         "test/sql/pragma/profiling/test_custom_profiling_row_group_metrics.test_slow",
@@ -432,6 +450,13 @@
       ]
     },
     {
+      "reason": "Iceberg does not allow changing a map's key; DuckDB tests rename and drop fields of a key struct",
+      "paths": [
+        "test/sql/alter/map/rename_column_in_struct.test",
+        "test/sql/alter/map/drop_column_in_struct.test"
+      ]
+    },
+    {
       "reason": "ALTER TABLE SET PARTITIONED BY is supported in Iceberg but DuckDB tests expect failure",
       "paths": [
         "test/sql/alter/alter_table_set_partitioned_by.test",
@@ -565,6 +590,7 @@
         "test/sql/aggregate/grouping_sets/grouping_sets_sum_having.test",
         "test/sql/explain/explain_execute.test",
         "test/sql/explain/tree_renderer_branches.test",
+        "test/sql/optimizer/self_join_aggregate.test",
         "test/sql/optimizer/test_common_subplan_table_filters.test",
         "test/sql/explain/test_explain_table_scan.test",
         "test/sql/function/numeric/test_is_nan.test",
@@ -586,6 +612,7 @@
       "reason": "Stats / memory_usage / transitive filter output reflects iceberg storage",
       "paths": [
         "test/sql/delete/in_memory_bulk_delete.test_slow",
+        "test/sql/storage/partial_blocks/partial_block_tail_memory.test",
         "test/sql/transactions/test_commit_cleanup_oom.test",
         "test/sql/function/date/date_part_stats.test",
         "test/sql/function/time/test_extract_stats.test",
@@ -757,6 +784,7 @@
     {
       "reason": "rowid column is not exposed on iceberg-backed tables",
       "paths": [
+        "test/sql/join/bloom_filter_rowid_deleted_rows.test",
         "test/sql/join/mark/large_mark_join.test_slow",
         "test/sql/join/natural/natural_join.test",
         "test/sql/join/pair_dependent_join_subquery.test",
@@ -787,7 +815,9 @@
         "test/sql/function/numeric/test_bit_count.test",
         "test/sql/join/inner/equality_join_limits.test",
         "test/sql/order/hugeint_order_by_extremes.test",
-        "test/sql/types/bignum/test_int_varchar_bignum_compatibility.test"
+        "test/sql/types/bignum/test_int_varchar_bignum_compatibility.test",
+        "test/sql/types/hugeint/hugeint_multiply.test",
+        "test/sql/types/hugeint/test_hugeint_to_floating_rounding.test"
       ]
     },
     {
@@ -1471,6 +1501,9 @@
       "reason": "Contains attach and use call, when config already uses iceberg attached db",
       "paths": [
         "test/sql/attach/attach_use_string_literal.test",
+        "test/sql/catalog/nested_schema/nested_search_path.test",
+        "test/sql/catalog/nested_schema_ctas.test",
+        "test/sql/function/list/lambdas/lambda_dot_calls_nested_schema.test",
         "test/sql/storage/metadata/partial_column_metadata_reuse_small_block.test",
         "test/sql/storage/compression/fsst/invalid_fsst_bitpacking_width.test",
         "test/sql/optimizer/boolean_wrapper_pushdown.test"
@@ -1504,8 +1537,11 @@
       "reason": "changing secret manager settings after the secret manager is used is not allowed",
       "paths": [
         "test/sql/parser/reject_accidental_statement_syntax.test",
+        "test/sql/secrets/create_secret_external_access.test",
         "test/sql/secrets/create_secret_filesystem_logging.test",
         "test/sql/secrets/http_env_scope_lookup.test",
+        "test/sql/secrets/http_secret_scope_authority.test",
+        "test/sql/secrets/refresh_info_redaction.test",
         "test/sql/settings/test_disabled_local_filesystem_metadata.test",
         "test/sql/settings/test_disabled_local_filesystem_secrets.test",
         "test/sql/settings/test_external_access_metadata.test",
@@ -1626,7 +1662,10 @@
     {
       "reason": "EXPLAIN ANALYZE row-groups-scanned / plan output differs on Iceberg parquet storage",
       "paths": [
+        "test/sql/cte/materialized/cte_runtime_filter_modes.test",
+        "test/sql/cte/materialized/cte_runtime_filter_sibling_dependencies.test",
         "test/sql/join/inner/test_join_filter_precedence.test",
+        "test/sql/join/runtime_filter_scheduling.test",
         "test/sql/optimizer/instr_zonemap_pruning.test",
         "test/sql/optimizer/late_materialization_table_filters.test",
         "test/sql/optimizer/monotone_function_zonemap_pruning.test",
@@ -1652,6 +1691,7 @@
     {
       "reason": "VARIANT containing BIGNUM cannot be written to Parquet VARIANT",
       "paths": [
+        "test/sql/function/generic/hash_comparison_keys.test",
         "test/sql/function/variant/variant_typeof.test"
       ]
     },
@@ -1706,6 +1746,7 @@
         "test/sql/catalog/nested_schema/nested_table_dml_persist.test",
         "test/sql/catalog/nested_schema/nested_table_dml.test",
         "test/sql/catalog/nested_schema/nested_table.test",
+        "test/sql/parser/drop_qualified_names.test",
         "test/sql/catalog/nested_schema/nested_table_columnref.test",
         "test/sql/storage/wal/wal_null_update_row_group_pruning.test",
         "test/sql/catalog/nested_schema/nested_wal_replay_index.test"
@@ -1888,18 +1929,6 @@
       ]
     },
     {
-      "reason": "VARIANT field equality filter returns 0 matches instead of 1; disabling filter_pushdown restores the correct result",
-      "paths": [
-        "test/sql/storage/types/variant/variant_extract_filter_pushdown.test"
-      ]
-    },
-    {
-      "reason": "Nested VARIANT projection fails with Parquet prefetching enabled",
-      "paths": [
-        "test/sql/optimizer/pushdown_extract_reapplied.test"
-      ]
-    },
-    {
       "reason": "Non-null whole-STRUCT defaults are accepted but DEFAULT inserts produce NULL",
       "paths": [
         "test/sql/storage/types/struct/default_struct.test",
@@ -1992,6 +2021,7 @@
     {
       "reason": "EXPLAIN and profiling assert native DuckDB row IDs and row group counts, not Iceberg scan behavior",
       "paths": [
+        "test/sql/optimizer/pushdown_extract_reapplied.test",
         "test/sql/optimizer/topn_window_elimination_late_materialization.test",
         "test/sql/pragma/profiling/test_custom_profiling_row_group_metrics_local_storage.test"
       ]
@@ -2035,6 +2065,7 @@
     {
       "reason": "Assertions require native column compression segments in pragma_storage_info, which Iceberg's Parquet-backed tables do not expose",
       "paths": [
+        "test/sql/filter/disjunctive_compressed_filter.test",
         "test/sql/storage/compression/constant/constant_negative_zero.test",
         "test/sql/storage/compression/rle/rle_select_force_fetch_row.test",
         "test/sql/storage/reclaim_space/test_reclaim_space_update_large_string.test"
@@ -2084,6 +2115,51 @@
         "test/sql/storage/revert_append_after_checkpoint_new_row_group.test",
         "test/sql/storage/revert_append_nested_list.test",
         "test/sql/topn/top_n_pruning_read_ahead.test"
+      ]
+    },
+    {
+      "reason": "New bump (910c73dabeafc0290907a0c37e09f6abed8e9446 -> dbde6f7aec17f9df7d9e23d027475fd84618ce8d)",
+      "paths": [
+        "test/sql/parallelism/async_task_synchronous_batch.test",
+        "test/sql/aggregate/group/perfect_hash_corrupt_stats_range.test",
+        "test/sql/aggregate/group/perfect_hash_corrupt_stats_wrapped_id.test",
+        "test/sql/alter/struct/add_col_struct_column_default.test",
+        "test/sql/catalog/nested_schema/nested_schema_search_path.test",
+        "test/sql/catalog/nested_schema/nested_view_function_attached.test",
+        "test/sql/catalog/nested_schema/nested_view_function_catalog.test",
+        "test/sql/catalog/system_functions/system_catalog_entry_pushdown.test",
+        "test/sql/secrets/persistent_secret_name_collision.test",
+        "test/sql/secrets/persistent_secret_name_path_traversal.test",
+        "test/sql/secrets/secrets_without_external_access.test",
+        "test/sql/storage/bc/null_rows_v1_5_or_filter.test",
+        "test/sql/storage/ctas_limit0_insert.test",
+        "test/sql/storage/temp_directory/offload_small_transient_segments.test",
+        "test/sql/storage/temp_directory/offload_small_transient_segments_no_optimistic_write.test",
+        "test/sql/optimizer/consistent_within_query_optimizations.test"
+      ]
+    },
+    {
+      "reason": "Iceberg uses quoted dotted namespace names; native nested-schema paths are rejected by the catalog capability check",
+      "paths": [
+        "test/sql/catalog/nested_schema/nested_drop_index.test",
+        "test/sql/catalog/nested_schema/nested_drop_sequence.test",
+        "test/sql/catalog/nested_schema/nested_foreign_key_paths.test",
+        "test/sql/catalog/nested_schema/nested_main_schema.test",
+        "test/sql/catalog/nested_schema/nested_missing_entries.test",
+        "test/sql/catalog/nested_schema/nested_show_all_tables.test",
+        "test/sql/catalog/nested_schema/nested_show_tables.test",
+        "test/sql/tpch/dbgen_nested_schema.test"
+      ]
+    },
+    {
+      "reason": "Temporary DuckDB core regression: Catalog::TryLookupEntry rejects nested-schema candidates before qualified method-call and replacement-scan fallbacks; ordinary alias.column.function() calls and dotted file paths fail when Iceberg is the default catalog",
+      "paths": [
+        "test/sql/binder/alias_qualification_select_projection.test",
+        "test/sql/binder/qualified_alias_method_call.test",
+        "test/sql/binder/test_function_chaining_alias.test",
+        "test/sql/catalog/function/query_table_file_paths.test",
+        "test/sql/join/non_inner_join_subquery_binding.test",
+        "test/sql/parser/function_chaining.test"
       ]
     }
   ]

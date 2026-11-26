@@ -28,14 +28,21 @@ static Value GetFieldIdValue(const IcebergColumnDefinition &column) {
 
 shared_ptr<IcebergTableSchema> IcebergTableSchema::ParseSchema(const rest_api_objects::Schema &schema) {
 	auto res = make_shared_ptr<IcebergTableSchema>();
-	D_ASSERT(schema.object_1.schema_id);
+	if (!schema.object_1.schema_id || *schema.object_1.schema_id < 0) {
+		throw InvalidConfigurationException("Iceberg schema must have a non-negative 'schema-id'");
+	}
 	res->schema_id = *schema.object_1.schema_id;
+	if (schema.struct_type.fields.empty()) {
+		throw InvalidConfigurationException("Iceberg schema %d contains no fields", res->schema_id);
+	}
 	for (auto &field : schema.struct_type.fields) {
 		res->columns.push_back(IcebergColumnDefinition::ParseStructField(*field));
 	}
 	if (auto &identifier_field_ids = schema.object_1.identifier_field_ids) {
 		res->identifier_field_ids = *identifier_field_ids;
 	}
+	// Reject duplicate IDs before any reader or writer can build an ambiguous field mapping.
+	res->GetSourceIdMap();
 	return res;
 }
 
@@ -67,7 +74,9 @@ void IcebergTableSchema::PopulateSourceIdMap(unordered_map<uint64_t, ColumnIndex
 		}
 
 		PopulateSourceIdMap(source_to_column_id, column->GetChildren(), new_index);
-		source_to_column_id.emplace(static_cast<uint64_t>(column->id), std::move(new_index));
+		if (!source_to_column_id.emplace(static_cast<uint64_t>(column->id), std::move(new_index)).second) {
+			throw InvalidConfigurationException("Duplicate field id %d in Iceberg schema", column->id);
+		}
 	}
 }
 
@@ -126,6 +135,32 @@ const IcebergColumnDefinition &IcebergTableSchema::GetColumnByFieldId(idx_t fiel
 		throw InvalidInputException("Field id %d does not exist in schema with id %d", field_id, schema_id);
 	}
 	return *column;
+}
+
+static void CollectFullNames(const IcebergColumnDefinition &column, const string &parent_name,
+                             vector<pair<int32_t, string>> &result) {
+	auto full_name = parent_name.empty() ? column.name : parent_name + "." + column.name;
+	result.emplace_back(column.id, full_name);
+	for (auto &child : column.GetChildren()) {
+		CollectFullNames(*child, full_name, result);
+	}
+}
+
+vector<pair<int32_t, string>> IcebergTableSchema::GetFullNames() const {
+	vector<pair<int32_t, string>> result;
+	for (auto &column : columns) {
+		CollectFullNames(*column, string(), result);
+	}
+	return result;
+}
+
+string IcebergTableSchema::GetFullColumnName(idx_t field_id) const {
+	for (auto &field : GetFullNames()) {
+		if (static_cast<idx_t>(field.first) == field_id) {
+			return field.second;
+		}
+	}
+	throw InvalidInputException("Field id %d does not exist in schema with id %d", field_id, schema_id);
 }
 
 optional_ptr<const IcebergColumnDefinition>
@@ -205,6 +240,67 @@ shared_ptr<IcebergTableSchema> IcebergTableSchema::RemoveColumn(const string &na
 		res->columns.push_back(column->Copy());
 	}
 	return res;
+}
+
+//! The position of 'field' in 'fields'. Fields are matched on their field id, so 'field' can come from another copy of
+//! the schema
+static optional_idx FieldIndex(const vector<unique_ptr<IcebergColumnDefinition>> &fields,
+                               const IcebergColumnDefinition &field) {
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (fields[i]->id == field.id) {
+			return i;
+		}
+	}
+	return optional_idx();
+}
+
+void IcebergTableSchema::MoveColumn(const vector<Identifier> &path, IcebergColumnMove move,
+                                    const vector<Identifier> &reference_path) {
+	auto path_name = StringUtil::Join(IdentifiersToStrings(path), ".");
+	auto column = GetFromPath(path, nullptr);
+	if (!column) {
+		throw InvalidInputException("Cannot move missing column: %s", path_name);
+	}
+	optional_ptr<const IcebergColumnDefinition> reference;
+	if (move != IcebergColumnMove::FIRST) {
+		auto direction = move == IcebergColumnMove::BEFORE ? "before" : "after";
+		reference = GetFromPath(reference_path, nullptr);
+		if (!reference) {
+			throw InvalidInputException("Cannot move %s %s missing column: %s", path_name, direction,
+			                            StringUtil::Join(IdentifiersToStrings(reference_path), "."));
+		}
+		if (reference->id == column->id) {
+			throw InvalidInputException("Cannot move %s %s itself", path_name, direction);
+		}
+	}
+
+	//! The siblings of the column: the fields of the struct that holds it, or the columns of the table
+	optional_ptr<IcebergColumnDefinition> parent;
+	if (path.size() > 1) {
+		parent = GetMutableFromPath(vector<Identifier>(path.begin(), path.end() - 1), nullptr);
+		if (parent->type.id() != LogicalTypeId::STRUCT) {
+			throw InvalidInputException("Cannot move %s: its parent is not a struct (type: %s)", path_name,
+			                            parent->type.ToString());
+		}
+	}
+	auto &siblings = parent ? parent->GetChildren() : columns;
+	auto from = FieldIndex(siblings, *column).GetIndex();
+	idx_t to = 0;
+	if (reference) {
+		auto reference_index = FieldIndex(siblings, *reference);
+		if (!reference_index.IsValid()) {
+			throw InvalidInputException("Cannot move %s to a different struct", path_name);
+		}
+		//! Where the reference stands once the column is taken out
+		auto position = reference_index.GetIndex() > from ? reference_index.GetIndex() - 1 : reference_index.GetIndex();
+		to = move == IcebergColumnMove::BEFORE ? position : position + 1;
+	}
+	if (parent) {
+		parent->MoveChild(from, to);
+	} else {
+		IcebergColumnDefinition::MoveField(columns, from, to);
+	}
+	InvalidateSourceIdMap();
 }
 
 const LogicalType &IcebergTableSchema::GetColumnTypeFromFieldId(idx_t field_id) const {

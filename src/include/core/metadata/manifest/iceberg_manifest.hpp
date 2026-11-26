@@ -94,6 +94,9 @@ public:
 	int64_t GetFirstRowId() const;
 	bool IsDeletionVector() const;
 	int64_t GetContentSizeInBytes() const;
+	//! The only data file this delete file holds deletes for: its 'referenced_data_file', or for a position
+	//! delete file the path both of its 'file_path' bounds agree on. Null if it may cover several data files.
+	optional_ptr<const string> SingleReferencedDataFile() const;
 
 public:
 	IcebergManifestEntryContentType content;
@@ -141,6 +144,10 @@ public:
 	void SetFileSequenceNumber(optional<sequence_number_t> value);
 	sequence_number_t GetSequenceNumber(const IcebergManifest &manifest_file) const;
 	sequence_number_t GetFileSequenceNumber(const IcebergManifest &manifest_file) const;
+	//! The explicit sequence number, or the one inherited from the manifest for ADDED entries.
+	//! Empty for EXISTING/DELETED entries written without one (e.g. DELETED entries written by older Iceberg versions).
+	optional<sequence_number_t> TryGetSequenceNumber(const IcebergManifest &manifest_file) const;
+	optional<sequence_number_t> TryGetFileSequenceNumber(const IcebergManifest &manifest_file) const;
 	optional<sequence_number_t> ExplicitSequenceNumber() const;
 	optional<sequence_number_t> ExplicitFileSequenceNumber() const;
 
