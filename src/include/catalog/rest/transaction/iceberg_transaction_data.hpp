@@ -31,9 +31,13 @@ public:
 	bool RetryStateMatches(const IcebergTable &table_info) const;
 	//! Whether this transaction stages a DELETE snapshot; gates the commit-retry safety check.
 	bool ContainsDelete() const;
+	void VerifySnapshotExpirationAllowed() const;
 	bool IsFileInvalidated(const IcebergFileIdentity &file) const;
+	bool HasInvalidatedFiles() const;
 	shared_ptr<IcebergMergeDeleteCollector> GetMergeDeleteCollector(idx_t action_count);
 	void VerifyMergeDeletesComplete() const;
+	//! Check restrictions left by earlier operations. Caller must hold lock.
+	void VerifyCanAddSnapshot() const;
 
 	void AddSnapshot(IcebergSnapshotOperationType operation, vector<IcebergManifestEntry> &&data_files,
 	                 IcebergManifestDeletes &&altered_manifests, bool merge_action = false);
@@ -58,9 +62,12 @@ public:
 	void TableSetDefaultSpec();
 	void TableSetProperties(const case_insensitive_map_t<string> &properties);
 	void TableRemoveProperties(const vector<string> &properties);
+	void TableRemoveSnapshots(const vector<int64_t> &snapshot_ids);
 	void TableSetLocation();
 	//! Roll main back to an ancestor snapshot (Spark rollback_to_snapshot semantics).
 	void TableRollbackToSnapshot(int64_t snapshot_id);
+	//! Detach main without removing historical snapshots or enumerating their files.
+	void TableReplaceContents(IcebergTableMetadata &metadata);
 
 private:
 	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata);
@@ -84,6 +91,8 @@ public:
 	int32_t initial_schema_id;
 	int32_t initial_default_spec_id = 0;
 	optional_idx initial_default_sort_order_id;
+	optional<int64_t> initial_snapshot_id;
+	bool replaces_table = false;
 
 	ClientContext &context;
 	IcebergTransaction &transaction;
@@ -98,6 +107,8 @@ public:
 
 	//! Each data-changing statement creates an alter; the actions of one MERGE share an alter.
 	vector<reference<IcebergAddSnapshot>> alters;
+	//! A pending V3 snapshot assigns lineage at commit, including to retained files from before an upgrade.
+	bool has_pending_v3_snapshot = false;
 	//! Snapshot this transaction is based on (the tip when the manifest list was first cached).
 	//! Drives the delete commit-retry safety check.
 	optional<int64_t> base_snapshot_id;
@@ -109,7 +120,13 @@ public:
 	bool assert_schema_id = false;
 	//! Whether this transaction explicitly requires the table to be newly created.
 	bool has_assert_create = false;
-	mutex lock;
+	//! Whether this transaction rolls main back (TableRollbackToSnapshot)
+	bool rolls_back = false;
+	//! Set explicitly by maintenance; its committed-table plan cannot be combined with later row changes.
+	bool has_maintenance_rewrite = false;
+	//! A MERGE chose its actions against the snapshot it read, so its commit can't be re-applied to a newer one.
+	bool contains_merge = false;
+	mutable mutex lock;
 };
 
 } // namespace duckdb

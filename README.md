@@ -1,11 +1,40 @@
-> [!WARNING]
-> This extension is experimental. APIs and behavior may change, and some catalog-specific features are not yet supported.
-
 # DuckDB extension for Apache Iceberg
 
 This repository contains DuckDB's Apache Iceberg extension. It adds support for reading and writing Iceberg tables, inspecting Iceberg metadata, and attaching Iceberg REST catalogs.
 
 User-facing documentation is available on the [Iceberg extension page](https://duckdb.org/docs/extensions/iceberg).
+
+## Tracking written data files
+
+Set `iceberg_store_written_files = true` before a write to collect the data files it
+stages in the connection's temporary table `temp.main.iceberg_written_files`.
+Each row contains `query_id`, `table`, `file_path`, `record_count`,
+`file_size_in_bytes`, `operation`, and `written_at`.
+
+The operation is `INSERT`, `CTAS`, `UPDATE`, `MERGE_INSERT`, `MERGE_UPDATE`,
+`COPY_ON_WRITE_DELETE`, or `REWRITE_DATA_FILES`. MERGE's insert and update actions
+share a query ID but have separate operation labels. Operations that write no new
+data files produce no rows.
+
+`written_at` is a `TIMESTAMPTZ` captured when a batch of files is reported after
+staging. Files in the same batch share the timestamp; separate statements within
+a transaction capture their own times. Use `query_id` and `file_path` to break
+timestamp ties. For example, after enabling tracking and performing writes:
+
+```sql
+SELECT query_id, operation, written_at, "table", file_path,
+       record_count, file_size_in_bytes
+FROM temp.main.iceberg_written_files
+WHERE operation IN ('INSERT', 'CTAS')
+ORDER BY written_at, query_id, file_path;
+```
+
+The `IcebergDataFileWritten` log type exposes the same operation and `written_at`
+fields independently of the storage setting. These describe staged files:
+rollback removes the temporary table's rows, while logs remain. The temporary
+catalog commits before the Iceberg catalog, so a failed Iceberg commit can leave
+tracking rows behind; a client requiring committed files must also check that
+the write committed successfully.
 
 ## Row lineage inside transactions
 
@@ -20,6 +49,12 @@ then updated within one transaction can receive a different `_row_id` in each
 of those snapshots: the updates cannot preserve an ID that has not been assigned
 yet. After commit, further updates preserve its assigned ID. Use a business key
 to identify pending rows, rather than relying on their nullable lineage columns.
+
+A copy-on-write DELETE must preserve the lineage of surviving rows in the files
+it rewrites. If an earlier v3 snapshot in the transaction still needs to assign
+a survivor's row ID or last update sequence, commit the earlier changes before
+running the DELETE. Removing a whole file or rewriting only rows with assigned
+lineage is supported in the same transaction.
 
 ## Development setup
 

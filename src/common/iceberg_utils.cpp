@@ -1,8 +1,10 @@
 #include "common/iceberg_utils.hpp"
+#include "catalog/rest/iceberg_catalog.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/gzip_file_system.hpp"
+#include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -14,6 +16,7 @@
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
 #include "core/metadata/iceberg_table_metadata.hpp"
+#include "catalog/rest/iceberg_file_credentials.hpp"
 #include "duckdb/catalog/catalog_entry_retriever.hpp"
 
 namespace duckdb {
@@ -90,7 +93,7 @@ idx_t IcebergUtils::CountOccurrences(const string &input, const string &to_find)
 	return count;
 }
 
-string IcebergUtils::FileToString(const string &path, FileSystem &fs) {
+string IcebergUtils::FileToString(const OpenFileInfo &file, FileSystem &fs) {
 	// This function is used to read table metadata files (e.g., metadata.json).
 	//
 	// We intentionally avoid calling GetFileSize() to pre-allocate the result buffer because
@@ -103,7 +106,22 @@ string IcebergUtils::FileToString(const string &path, FileSystem &fs) {
 	//
 	// We read directly into the result string's buffer to avoid an intermediate copy,
 	// growing the buffer 2x when space runs out (amortized O(1) per byte).
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	//
+	// Opening a remote file normally costs a HEAD request (httpfs needs the size for range reads) before the
+	// first GET. These files are read whole, so ask for a full download instead: httpfs then skips the HEAD and
+	// fetches the object with a single GET, serving the reads below from that download. File systems that do not
+	// know the hint ignore it. A caller that already knows the size (or asked otherwise) is left alone.
+	OpenFileInfo to_open = file;
+	to_open.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	if (file.extended_info) {
+		*to_open.extended_info = *file.extended_info;
+	}
+	auto &open_options = to_open.extended_info->options;
+	if (open_options.find("file_size") == open_options.end() &&
+	    open_options.find("force_full_download") == open_options.end()) {
+		open_options["force_full_download"] = Value::BOOLEAN(true);
+	}
+	auto handle = fs.OpenFile(to_open, FileFlags::FILE_FLAGS_READ);
 	string result;
 	idx_t capacity = 32768;
 	idx_t size = 0;
@@ -259,7 +277,7 @@ string IcebergUtils::GetStorageLocation(ClientContext &context, const string &in
 				throw InvalidInputException("Table %s is not an Iceberg table", input);
 			}
 			auto &table_entry = catalog_entry->Cast<IcebergTableSchemaVersion>();
-			storage_location = table_entry.table_info.table_metadata.GetLocation();
+			storage_location = table_entry.table_info.GetMetadata().GetLocation();
 			// Prepare Iceberg Scan from entry will create the secret needed to access the table
 			table_entry.PrepareIcebergScanFromEntry(context);
 			break;
@@ -280,8 +298,11 @@ IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &contex
 
 			auto &iceberg_table = catalog_entry->Cast<IcebergTableSchemaVersion>();
 			iceberg_table.PrepareIcebergScanFromEntry(context);
-			auto &metadata = iceberg_table.table_info.table_metadata;
-			return IcebergResolvedMetadata(metadata.GetLocation(), metadata.Copy());
+			auto &metadata = iceberg_table.table_info.GetMetadata();
+			return IcebergResolvedMetadata(
+			    metadata.GetLocation(), iceberg_table.table_info.GetMetadataOwner(),
+			    IcebergFileSecret(IcebergFileCredentialsCallback::Get(context, iceberg_table.table_info),
+			                      std::to_string(iceberg_table.table_info.catalog.GetOid())));
 		}
 	}
 
@@ -290,13 +311,15 @@ IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &contex
 	auto caching_fs = make_shared_ptr<CachingFileSystemWrapper>(fs, *context.db);
 	auto metadata_path = IcebergTableMetadata::GetMetaDataPath(context, table_location, fs, options);
 	auto table_metadata = IcebergTableMetadata::Parse(metadata_path, *caching_fs, options.metadata_compression_codec);
-	return IcebergResolvedMetadata(std::move(table_location), IcebergTableMetadata::FromTableMetadata(table_metadata));
+	return IcebergResolvedMetadata(
+	    std::move(table_location),
+	    make_shared_ptr<const IcebergTableMetadata>(IcebergTableMetadata::FromTableMetadata(table_metadata)));
 }
 
 // Function to decompress a gz file content string
-string IcebergUtils::GzFileToString(const string &path, FileSystem &fs) {
+string IcebergUtils::GzFileToString(const OpenFileInfo &file, FileSystem &fs) {
 	// Initialize zlib variables
-	string gzipped_string = FileToString(path, fs);
+	string gzipped_string = FileToString(file, fs);
 	return GZipFileSystem::UncompressGZIPString(gzipped_string);
 }
 

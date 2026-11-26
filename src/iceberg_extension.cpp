@@ -1,4 +1,5 @@
 #include "iceberg_extension.hpp"
+#include "execution/operator/iceberg_written_files.hpp"
 
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/logging/log_manager.hpp"
@@ -49,6 +50,15 @@ static void SetMetadataLogClockSkew(ClientContext &context, SetScope scope, Valu
 	if (parameter.IsNull() || parameter.GetValue<int64_t>() < 0) {
 		throw InvalidConfigurationException("'%s' must be a non-negative number of milliseconds",
 		                                    METADATA_LOG_CLOCK_SKEW_CONFIG_VARIABLE);
+	}
+}
+
+static void SetMaxReservedManifestEntries(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull() || parameter.GetValue<uint64_t>() == 0 ||
+	    parameter.GetValue<uint64_t>() > MAX_MAX_RESERVED_MANIFEST_ENTRIES) {
+		throw InvalidConfigurationException("'%s' must be between 1 and %llu (the maximum), got %s",
+		                                    MAX_RESERVED_MANIFEST_ENTRIES_CONFIG_VARIABLE,
+		                                    MAX_MAX_RESERVED_MANIFEST_ENTRIES, parameter.ToString());
 	}
 }
 
@@ -108,9 +118,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption(
 	    SKIP_PUFFIN_VERIFICATION_CONFIG_VARIABLE,
-	    "Skip structural Puffin verification for deletion-vector files. This unsafe compatibility option permits "
-	    "reading invalid bare-blob files written by DuckDB Iceberg 1.5.3.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	    "When true (default), trust the deletion-vector offset and length recorded in the manifest and skip "
+	    "structural Puffin footer verification. Set to false to require a valid Puffin footer; this rejects "
+	    "Delta deletion-vector files referenced by UniForm and legacy DuckDB bare-blob files.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_SKIP_PUFFIN_VERIFICATION), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("iceberg_test_force_token_expiry",
 	                          "DEBUG SETTING: force OAuth2 token expiry for testing automatic refresh",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
@@ -130,6 +141,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "far after transaction start is considered visible. Set to 0 for strict timestamp comparisons.",
 	    LogicalType::BIGINT, Value::BIGINT(DEFAULT_METADATA_LOG_CLOCK_SKEW_MS), SetMetadataLogClockSkew,
 	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    MAX_RESERVED_MANIFEST_ENTRIES_CONFIG_VARIABLE,
+	    "The maximum number of manifest entries the manifest-list file counts may reserve up front for a single "
+	    "manifest. Scanning a manifest that declares more entries fails; the setting can be raised up to 100000000.",
+	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_MAX_RESERVED_MANIFEST_ENTRIES), SetMaxReservedManifestEntries);
+	config.AddExtensionOption(
+	    IcebergWrittenFiles::SETTING,
+	    "Add the data files each Iceberg write stages to the temporary table "
+	    "iceberg_written_files, with their operation and written_at time, in the write's transaction",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(ENABLE_MANIFEST_CACHE_CONFIG_VARIABLE,
+	                          "Cache immutable parsed Iceberg manifests and delete candidate indexes",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(ENABLE_TABLE_STATISTICS_CONFIG_VARIABLE,
+	                          "Give the optimizer the distinct counts recorded in a table's statistics files",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_ENABLE_TABLE_STATISTICS));
 	config.AddExtensionOption("iceberg_use_server_side_scan_planning",
 	                          "Whether or not to use server-side scanning planning (if available)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
@@ -137,6 +164,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ENABLE_MULTI_FILE_SCAN_TASKS_CONFIG_VARIABLE,
 	    "Execute eligible delete-free iceberg_scan_tasks descriptor lists through one Parquet multi-file scan.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_ENABLE_MULTI_FILE_SCAN_TASKS), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    ENABLE_SCAN_SERIALIZATION_CONFIG_VARIABLE,
+	    "Enable statement-local serialization of catalog-backed Iceberg scans for logical-plan copying. When disabled, "
+	    "copy-based optimizations retain the original plan.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_ENABLE_SCAN_SERIALIZATION), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "iceberg_logging_post_body_truncate_limit",
 	    "Maximum number of characters of a REST catalog POST body to include in Iceberg log messages. "
@@ -191,6 +223,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto &log_manager = instance.GetLogManager();
 	log_manager.RegisterLogType(make_uniq<IcebergLogType>());
+	log_manager.RegisterLogType(make_uniq<IcebergDataFileWrittenLogType>());
 	StorageExtension::Register(config, "iceberg", make_shared_ptr<IRCStorageExtension>());
 	PlannerExtension::Register(config, IcebergPlanner::Create());
 }

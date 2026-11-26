@@ -1,5 +1,8 @@
 #include "core/metadata/partition/iceberg_partition_spec.hpp"
 #include "catalog/rest/api/catalog_utils.hpp"
+#include "core/metadata/schema/iceberg_table_schema.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
 
@@ -9,12 +12,19 @@ IcebergPartitionSpecField IcebergPartitionSpecField::ParseFromJson(const rest_ap
 
 	result.name = field.name;
 	result.transform = field.transform.value;
+	if (field.source_id <= 0) {
+		throw InvalidConfigurationException("Invalid source id %d for partition field '%s'", field.source_id,
+		                                    field.name);
+	}
 	result.source_id = field.source_id;
 	if (assigned_field_id.IsValid()) {
 		result.partition_field_id = assigned_field_id.GetIndex();
 	} else {
 		if (!field.field_id) {
 			throw InvalidConfigurationException("Partition field '%s' is missing 'field-id'", field.name);
+		}
+		if (*field.field_id <= 0) {
+			throw InvalidConfigurationException("Invalid partition field id %d for '%s'", *field.field_id, field.name);
 		}
 		result.partition_field_id = *field.field_id;
 	}
@@ -25,7 +35,7 @@ bool IcebergPartitionSpecField::Equals(const IcebergPartitionSpecField &other) c
 	return source_id == other.source_id && transform.RawType() == other.transform.RawType();
 }
 
-bool IcebergPartitionSpec::Equals(const IcebergPartitionSpec &other) const {
+bool IcebergPartitionSpec::Equals(const IcebergPartitionSpec &other, bool compare_field_ids) const {
 	if (fields.size() != other.fields.size()) {
 		return false;
 	}
@@ -34,15 +44,24 @@ bool IcebergPartitionSpec::Equals(const IcebergPartitionSpec &other) const {
 		    fields[i].GetPartitionSpecFieldName() != other.fields[i].GetPartitionSpecFieldName()) {
 			return false;
 		}
+		if (compare_field_ids && fields[i].partition_field_id != other.fields[i].partition_field_id) {
+			return false;
+		}
 	}
 	return true;
 }
 
 IcebergPartitionSpec IcebergPartitionSpec::ParseFromJson(const rest_api_objects::PartitionSpec &partition_spec,
                                                          int32_t iceberg_version) {
-	D_ASSERT(partition_spec.spec_id);
-	IcebergPartitionSpec result(*partition_spec.spec_id);
-	auto &fields = partition_spec.fields;
+	if (!partition_spec.spec_id || *partition_spec.spec_id < 0) {
+		throw InvalidConfigurationException("Iceberg partition spec must have a non-negative 'spec-id'");
+	}
+	return FromFields(partition_spec.fields, *partition_spec.spec_id, iceberg_version);
+}
+
+IcebergPartitionSpec IcebergPartitionSpec::FromFields(const vector<rest_api_objects::PartitionField> &fields,
+                                                      int32_t spec_id, int32_t iceberg_version) {
+	IcebergPartitionSpec result(spec_id);
 	idx_t missing_field_ids = 0;
 	for (auto &field : fields) {
 		if (!field.field_id) {
@@ -57,12 +76,18 @@ IcebergPartitionSpec IcebergPartitionSpec::ParseFromJson(const rest_api_objects:
 		    "Cannot parse partition spec %d with missing field IDs: %d missing of %d fields", result.spec_id,
 		    missing_field_ids, fields.size());
 	}
+	unordered_set<idx_t> field_ids;
 	for (idx_t i = 0; i < fields.size(); i++) {
 		optional_idx assigned_field_id;
 		if (assign_field_ids) {
 			assigned_field_id = 1000 + i;
 		}
-		result.fields.push_back(IcebergPartitionSpecField::ParseFromJson(fields[i], assigned_field_id));
+		auto field = IcebergPartitionSpecField::ParseFromJson(fields[i], assigned_field_id);
+		if (!field_ids.insert(field.partition_field_id).second) {
+			throw InvalidConfigurationException("Duplicate partition field id %d in spec %d", field.partition_field_id,
+			                                    spec_id);
+		}
+		result.fields.push_back(std::move(field));
 	}
 	return result;
 }
@@ -70,7 +95,7 @@ IcebergPartitionSpec IcebergPartitionSpec::ParseFromJson(const rest_api_objects:
 bool IcebergPartitionSpec::IsPartitioned() const {
 	//! A partition spec is considered partitioned if it has at least one field that doesn't have a 'void' transform
 	for (const auto &field : fields) {
-		if (field.transform != IcebergTransformType::VOID) {
+		if (field.transform != IcebergTransformType::VOID_TRANSFORM) {
 			return true;
 		}
 	}
@@ -86,20 +111,79 @@ const vector<IcebergPartitionSpecField> &IcebergPartitionSpec::GetFields() const
 	return fields;
 }
 
-void IcebergPartitionSpecField::SetPartitionSpecFieldName(const string &column_name) {
-	string transform_raw_type = transform.RawType();
-	for (idx_t i = 0; i < transform_raw_type.size(); i++) {
-		char c = transform_raw_type[i];
-		bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-		if (!valid) {
-			transform_raw_type[i] = '_';
+void IcebergPartitionSpecField::SetPartitionSpecFieldName(const string &column_name, const string &suffix) {
+	switch (transform.Type()) {
+	case IcebergTransformType::IDENTITY:
+		name = column_name;
+		break;
+	case IcebergTransformType::BUCKET:
+		name = StringUtil::Format("%s_bucket_%d", column_name, transform.GetBucketModulo());
+		break;
+	case IcebergTransformType::TRUNCATE:
+		name = StringUtil::Format("%s_trunc_%d", column_name, transform.GetTruncateWidth());
+		break;
+	case IcebergTransformType::YEAR:
+		name = column_name + "_year";
+		break;
+	case IcebergTransformType::MONTH:
+		name = column_name + "_month";
+		break;
+	case IcebergTransformType::DAY:
+		name = column_name + "_day";
+		break;
+	case IcebergTransformType::HOUR:
+		name = column_name + "_hour";
+		break;
+	default:
+		throw NotImplementedException("No default partition field name for transform '%s'", transform.RawType());
+	}
+	name += suffix;
+}
+
+void IcebergPartitionSpec::FinalizeFieldNames(const IcebergTableSchema &schema, idx_t first_new_field_id) {
+	case_insensitive_map_t<int32_t> schema_field_ids;
+	case_insensitive_set_t reserved_names;
+	for (auto &field : schema.GetFullNames()) {
+		schema_field_ids.emplace(field.second, field.first);
+		reserved_names.insert(field.second);
+	}
+
+	case_insensitive_set_t assigned_names;
+	unordered_map<uint64_t, unordered_set<string>> source_transforms;
+	for (auto &field : fields) {
+		auto &name = field.GetPartitionSpecFieldName();
+		// Generating another label must not turn a repeated expression into a second partition field.
+		if (!source_transforms[field.source_id].insert(field.transform.RawType()).second) {
+			throw InvalidInputException("Cannot use partition name more than once: %s", name);
+		}
+		reserved_names.insert(name);
+		if (field.partition_field_id < first_new_field_id && !assigned_names.insert(name).second) {
+			throw InvalidInputException("Cannot use partition name more than once: %s", name);
 		}
 	}
-	// Avro names must not start with a digit
-	if (!transform_raw_type.empty() && transform_raw_type[0] >= '0' && transform_raw_type[0] <= '9') {
-		transform_raw_type = "_" + transform_raw_type;
+
+	for (auto &field : fields) {
+		if (field.partition_field_id < first_new_field_id) {
+			continue;
+		}
+		auto &name = field.GetPartitionSpecFieldName();
+		auto column = schema_field_ids.find(name);
+		bool schema_conflict =
+		    column != schema_field_ids.end() && (field.transform.Type() != IcebergTransformType::IDENTITY ||
+		                                         static_cast<uint64_t>(column->second) != field.source_id);
+		if (schema_conflict || assigned_names.count(name)) {
+			auto source_name = schema.GetFullColumnName(field.source_id);
+			auto base_suffix = "_" + to_string(field.partition_field_id);
+			auto suffix = base_suffix;
+			idx_t attempt = 0;
+			do {
+				field.SetPartitionSpecFieldName(source_name, suffix);
+				suffix = base_suffix + "_" + to_string(++attempt);
+			} while (reserved_names.count(name));
+		}
+		assigned_names.insert(name);
+		reserved_names.insert(name);
 	}
-	name = transform_raw_type + "_" + column_name + "_" + to_string(source_id);
 }
 
 const string &IcebergPartitionSpecField::GetPartitionSpecFieldName() const {

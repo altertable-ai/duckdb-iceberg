@@ -60,10 +60,10 @@ struct AssertCurrentSchemaIdRequirement : public IcebergTableRequirement {
 struct AssertRefSnapshotId : public IcebergTableRequirement {
 	static constexpr const IcebergTableRequirementType TYPE = IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID;
 
-	explicit AssertRefSnapshotId(int64_t snapshot_id);
+	explicit AssertRefSnapshotId(optional<int64_t> snapshot_id);
 	void CreateRequirement(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state);
 
-	int64_t snapshot_id;
+	optional<int64_t> snapshot_id;
 };
 
 //! The table's last assigned column id (a.k.a last_column_id) must match the requirement's `last-assigned-field-id`
@@ -177,6 +177,18 @@ struct RemoveProperties : public IcebergTableUpdate {
 	vector<string> properties;
 };
 
+//! Remove snapshots from metadata through REST "remove-snapshots".
+//! This update does not delete data or metadata files.
+struct RemoveSnapshots : public IcebergTableUpdate {
+	static constexpr const IcebergTableUpdateType TYPE = IcebergTableUpdateType::REMOVE_SNAPSHOTS;
+
+	explicit RemoveSnapshots(vector<int64_t> snapshot_ids);
+	void AddSnapshotIds(const vector<int64_t> &snapshot_ids);
+	void CreateUpdate(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state) const override;
+
+	vector<int64_t> snapshot_ids;
+};
+
 struct SetLocation : public IcebergTableUpdate {
 	static constexpr const IcebergTableUpdateType TYPE = IcebergTableUpdateType::SET_LOCATION;
 
@@ -193,6 +205,15 @@ struct SetSnapshotRef : public IcebergTableUpdate {
 	void CreateUpdate(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state) const override;
 
 	int64_t snapshot_id;
+	string ref_name;
+};
+
+struct RemoveSnapshotRef : public IcebergTableUpdate {
+	static constexpr const IcebergTableUpdateType TYPE = IcebergTableUpdateType::REMOVE_SNAPSHOT_REF;
+
+	explicit RemoveSnapshotRef(string ref_name);
+	void CreateUpdate(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state) const override;
+
 	string ref_name;
 };
 

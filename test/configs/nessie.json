@@ -51,7 +51,6 @@
 		{
 			"reason": "Requires reparsing url paths in logs or paths in data files",
 			"paths": [
-				"test/sql/local/catalog_test_config_setup/catalog_agnostic/iceberg_catalog_eager_refresh.test",
 				"test/sql/local/catalog_test_config_setup/catalog_interop/reads/test_read_partitioned_table_type_promotion.test",
 				"test/sql/local/catalog_test_config_setup/catalog_interop/irc_catalog_read_deletes.test"
 			]
@@ -67,6 +66,17 @@
 			"reason": "Nessie ignores the requested 'format-version' on CREATE TABLE and creates the table as V2, so V1 tables cannot be created",
 			"paths": [
 				"test/sql/local/catalog_test_config_setup/catalog_agnostic/test_v1_unsupported_writes.test"
+			]
+		},
+		{
+			"reason": "Nessie sets gc.enabled=false and rejects external snapshot management through remove-snapshots.",
+			"paths": [
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_atomic.test",
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_commit.test",
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_conflict.test",
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_history.test",
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_one_statement.test",
+				"test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/expire_snapshots_properties.test"
 			]
 		},
 		{
